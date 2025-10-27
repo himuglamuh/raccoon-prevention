@@ -1,0 +1,15 @@
+[Unit]
+Description=Spotify Daemon (spotifyd)
+After=network.target sound.target
+
+[Service]
+ExecStart=/usr/local/bin/spotifyd --no-daemon --config-path /home/YOUR_USER/.config/spotifyd/spotifyd.conf
+ExecStartPost=/usr/local/bin/spotifyd-auto-resume.sh
+Restart=always
+RestartSec=10
+User=YOUR_USER
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=multi-user.target

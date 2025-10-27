@@ -1,0 +1,10 @@
+[Unit]
+Description=Keep spotifyd alive and restart if needed
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
