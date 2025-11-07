@@ -4,7 +4,6 @@
 CLIENT_ID=""
 CLIENT_SECRET=""
 REFRESH_TOKEN=""
-DEVICE_NAME="raccoon-prevention" # change to match if you edited spotifyd.conf device name
 CONTEXT_URI="" # your artist/playlist - see readme.md for more details
 DEV_ID=""
 ### --------------------- ###
@@ -29,12 +28,18 @@ if [[ "$PLAYING" != "true" ]]; then
     -H "Content-Type: application/json" \
     -d '{"device_ids":["'"$DEV_ID"'"],"play":true}' \
     $API/me/player
+
   sleep 3
+
   curl -s -X PUT \
     -H "Authorization: Bearer $ACCESS" \
     -H "Content-Type: application/json" \
-    -d '{"context_uri": "$CONTEXT_URI"}' \
-    "$API/me/player/play?device_id=$DEV_ID"
+    -d "{\"context_uri\": \"$CONTEXT_URI\"}" \
+    $API/me/player/play?device_id=$DEV_ID
+
+  curl -s -X PUT \
+    -H "Authorization: Bearer $ACCESS" \
+    $API/v1/me/player/repeat?state=context
 else
   echo "$(date): Playback active elsewhere, doing nothing."
 fi
