@@ -1,0 +1,18 @@
+[Unit]
+Description=Spotify auto Telegram command bot (long-poll getUpdates)
+# Needs outbound HTTPS to api.telegram.org; keep retrying if the net is down.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/bin/spotify-auto bot
+Restart=always
+RestartSec=10
+# Required so /reauth can call `tailscale serve` (via sudo) and systemctl --user.
+Environment=XDG_RUNTIME_DIR=%t
+# Flush log lines to the journal promptly (long-running daemon).
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

@@ -21,6 +21,7 @@
 | `token.json` | `0600` | Refresh token, cached access token + expiry, `authorized_at`, scope |
 | `auth-needed` | `0600` | Sentinel: present ⇒ a human must re-authorize |
 | `alert-state.json` | `0600` | Per-alert throttle timestamps |
+| `bot-offset.json` | `0600` | Telegram bot: last processed `update_id` (no secrets) |
 | `.lock` | `0600` | flock target serializing token refresh/rotation |
 
 The directory itself is `0700`. Access tokens are short-lived (~1 h) and cached
@@ -65,3 +66,26 @@ unavoidable. Mitigations here:
 via Tailscale **Serve** (tailnet-private, TLS-terminated by Tailscale) — never
 Tailscale Funnel, so the callback is never reachable from the public internet.
 The OAuth `state` parameter is validated on the callback to prevent CSRF.
+
+## Telegram command bot (`spotify-auto bot`)
+
+The optional command bot lets you control the kiosk from Telegram. Its exposure
+is deliberately minimal:
+
+- **Outbound only / no open port.** It uses Telegram **long-polling**
+  (`getUpdates` over HTTPS to `api.telegram.org`); it never opens an inbound
+  port and never sets a webhook. Nothing on the Pi is reachable from outside.
+- **Single-chat allowlist.** Every update is checked against
+  `TELEGRAM_CHAT_ID`; messages from any other chat id are logged and dropped.
+  Anyone who finds the bot's username can message it, but only you can command
+  it.
+- **`/reauth` is powerful but contained.** It runs `reauth --remote`, which
+  briefly uses Tailscale Serve (see above) and sends the approval link **only**
+  to the allowlisted chat. Completing it still requires logging into your
+  Spotify account on the device you open the link with.
+- **Bot token is a secret.** It lives in `config.env` (`0600`) like the rest.
+  If it leaks, revoke/rotate it via **@BotFather** (`/revoke`) and update
+  `config.env`.
+- Only one re-auth runs at a time (guarded by a lock); a restart of the service
+  never replays old commands (the processed `update_id` offset is persisted to
+  `bot-offset.json`).

@@ -113,6 +113,22 @@ bot any message so it can auto-detect your chat id. Test it:
 spotify-auto notify --test
 ```
 
+### Command bot (optional)
+
+The same bot can also take commands so you can control the Pi from your phone
+(`/status`, `/nowplaying`, `/resume`, `/restart`, `/reauth`, `/health`, `/log`). It uses
+Telegram long-polling — no public webhook or open port — and **only your
+`TELEGRAM_CHAT_ID` is authorized**. `./install.sh --enable` starts it
+automatically once Telegram is configured; otherwise start it manually:
+
+```bash
+systemctl --user enable --now spotify-auto-bot.service
+journalctl --user -u spotify-auto-bot.service -f   # watch it
+```
+
+Then message your bot `/help`. `/reauth` runs `reauth --remote` and sends you a
+Tailscale approval link, so it needs Tailscale set up (section 2).
+
 ---
 
 ## 7. Enable everything (cutover)
@@ -128,6 +144,7 @@ This enables + starts:
 - `spotify-kiosk-nightly-restart.timer` (04:00)
 - `spotify-auto-resume.timer` (every 4 min)
 - `spotify-auto-tokencheck.timer` (daily)
+- `spotify-auto-bot.service` (only if Telegram is configured)
 
 So the timers run even when you're not logged in:
 

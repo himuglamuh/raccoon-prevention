@@ -51,6 +51,17 @@ if [ "${1:-}" = "--enable" ]; then
     spotify-auto-resume.timer \
     spotify-auto-tokencheck.timer
   echo "Enabled + started kiosk service and all timers."
+  # The Telegram command bot is optional; only enable it once a bot token and
+  # chat id are configured (spotify-auto notify --setup).
+  if grep -q '^TELEGRAM_BOT_TOKEN=.\+' "$CFG_DIR/config.env" 2>/dev/null \
+     && grep -q '^TELEGRAM_CHAT_ID=.\+' "$CFG_DIR/config.env" 2>/dev/null; then
+    systemctl --user enable --now spotify-auto-bot.service
+    echo "Enabled + started spotify-auto-bot.service (Telegram is configured)."
+  else
+    echo "Skipping spotify-auto-bot.service (Telegram not configured yet)."
+    echo "  After 'spotify-auto notify --setup', run:"
+    echo "    systemctl --user enable --now spotify-auto-bot.service"
+  fi
 fi
 
 cat <<EOF
@@ -63,6 +74,10 @@ Next steps:
   3. Alerts  (optional):  spotify-auto notify --setup
   4. Enable  (cutover):   ./install.sh --enable
   5. Verify:              spotify-auto status --probe
+
+The same Telegram bot can also take commands (status, reauth, restart...):
+  after 'notify --setup', '--enable' starts spotify-auto-bot.service; then
+  message your bot /help. Only TELEGRAM_CHAT_ID is allowed to command it.
 
 Tip: enable lingering so user timers run without an active login:
        sudo loginctl enable-linger "$USER"

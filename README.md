@@ -40,6 +40,7 @@ spotify-kiosk-watchdog.timer  ──▶ spotify-auto watchdog     (restart if we
 spotify-kiosk-nightly-restart ──▶ restart at 04:00          (preventive)
 spotify-auto-resume.timer     ──▶ spotify-auto auto-resume  (play if idle, 4 min)
 spotify-auto-tokencheck.timer ──▶ spotify-auto status --alert (daily; 6-mo wall)
+spotify-auto-bot.service      ──▶ spotify-auto bot          (optional; Telegram commands)
 
 secrets/state: ~/.config/spotify-auto/{config.env, token.json, auth-needed, ...}
 ```
@@ -55,6 +56,7 @@ secrets/state: ~/.config/spotify-auto/{config.env, token.json, auth-needed, ...}
 | `auto-resume` | If the kiosk is idle, start the configured context (+ repeat). Random-volume heartbeat when already playing. |
 | `watchdog` | Probe DevTools + Connect-device presence; restart the kiosk after 3 consecutive failures. |
 | `notify` | Send an alert; `--setup` configures Telegram; `--test` sends a test. |
+| `bot` | Run the Telegram command bot (long-poll); control the kiosk from your phone. |
 
 ## Install
 
@@ -78,6 +80,32 @@ Then follow **[docs/SETUP.md](docs/SETUP.md)**:
 4. `spotify-auto notify --setup` (optional Telegram alerts).
 5. `./install.sh --enable` to enable + start the kiosk and timers.
 6. `spotify-auto status --probe` to confirm.
+
+## Control from Telegram (optional)
+
+The same bot used for alerts can also take **commands**, so you can drive the Pi
+from your phone. Enable it after `spotify-auto notify --setup`:
+
+```bash
+systemctl --user enable --now spotify-auto-bot.service   # ./install.sh --enable does this for you
+```
+
+Then message your bot:
+
+| Command | What it does |
+|---|---|
+| `/status` | Token / device health (general). |
+| `/status detailed` | Live probe: device list, kiosk presence, current track. |
+| `/nowplaying` | What's playing right now. |
+| `/resume` | Play the configured context if the kiosk is idle. |
+| `/restart` | Restart the kiosk service. |
+| `/reauth` | Re-authorize Spotify — the bot sends you a Tailscale link to approve. |
+| `/health` | Quick liveness check. |
+| `/log` | Tail the `spotify-auto` log (optional line count, e.g. `/log 40`). |
+| `/help` | List commands. |
+
+It uses Telegram **long-polling** (no public webhook / open port). **Only
+`TELEGRAM_CHAT_ID` is authorized**; messages from any other chat are ignored.
 
 ## The 6-month wall (important)
 

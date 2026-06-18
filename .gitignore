@@ -5,6 +5,7 @@ config.env
 token.json
 auth-needed
 alert-state.json
+bot-offset.json
 *.lock
 .lock
 *.log

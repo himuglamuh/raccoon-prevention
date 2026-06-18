@@ -286,15 +286,21 @@ def _notify_send(msg):
         pass
 
 
-def _telegram_send(msg, cfg):
-    bot = cfg.get("TELEGRAM_BOT_TOKEN")
-    chat = cfg.get("TELEGRAM_CHAT_ID")
-    if not bot or not chat:
+def _telegram_api(token, method, params=None, timeout=HTTP_TIMEOUT):
+    """Call a Telegram Bot API method via POST. Returns (status, body)."""
+    url = "https://api.telegram.org/bot%s/%s" % (token, method)
+    return http_request("POST", url, form=(params or {}), timeout=timeout)
+
+
+def _telegram_send(msg, cfg, parse_mode=None, chat=None):
+    token = cfg.get("TELEGRAM_BOT_TOKEN")
+    chat = chat or cfg.get("TELEGRAM_CHAT_ID")
+    if not token or not chat:
         return False
-    url = "https://api.telegram.org/bot%s/sendMessage" % bot
-    status, body = http_request(
-        "POST", url,
-        form={"chat_id": chat, "text": msg, "disable_notification": "false"})
+    params = {"chat_id": chat, "text": msg, "disable_notification": "false"}
+    if parse_mode:
+        params["parse_mode"] = parse_mode
+    status, body = _telegram_api(token, "sendMessage", params)
     if status == 200:
         return True
     log("telegram send failed: status=%s body=%s" % (status, body))
@@ -631,45 +637,66 @@ def cmd_token(args):
 # Subcommand: status
 # --------------------------------------------------------------------------- #
 
-def cmd_status(args):
-    cfg = load_config()
+def status_report(cfg, probe=False):
+    """Build status lines + needs_reauth flag. No side effects (no alerts)."""
     tok = read_json(TOKEN_FILE, {})
-    quiet = args.quiet
-
-    def out(msg):
-        if not quiet:
-            print(msg)
-
-    out("host:        %s" % hostname())
-    out("config dir:  %s" % CONFIG_DIR)
-    out("config.env:  %s" % ("present" if os.path.exists(CONFIG_ENV) else "MISSING"))
-    out("client id:   %s" % ("set" if cfg.get("CLIENT_ID") else "MISSING"))
-    out("context uri: %s" % cfg.get("CONTEXT_URI", "(unset)"))
-    out("device name: %s" % cfg.get("DEVICE_NAME", "(unset)"))
-    out("telegram:    %s" % ("configured"
-                             if cfg.get("TELEGRAM_BOT_TOKEN") and cfg.get("TELEGRAM_CHAT_ID")
-                             else "not configured"))
+    lines = []
+    lines.append("host:        %s" % hostname())
+    lines.append("config dir:  %s" % CONFIG_DIR)
+    lines.append("config.env:  %s" % ("present" if os.path.exists(CONFIG_ENV) else "MISSING"))
+    lines.append("client id:   %s" % ("set" if cfg.get("CLIENT_ID") else "MISSING"))
+    lines.append("context uri: %s" % cfg.get("CONTEXT_URI", "(unset)"))
+    lines.append("device name: %s" % cfg.get("DEVICE_NAME", "(unset)"))
+    lines.append("telegram:    %s" % ("configured"
+                 if cfg.get("TELEGRAM_BOT_TOKEN") and cfg.get("TELEGRAM_CHAT_ID")
+                 else "not configured"))
 
     has_refresh = bool(tok.get("refresh_token"))
-    out("refresh tok: %s" % ("stored" if has_refresh else "MISSING"))
+    lines.append("refresh tok: %s" % ("stored" if has_refresh else "MISSING"))
 
-    authorized_at, days_used, days_left = token_health(tok)
     needs_reauth = os.path.exists(SENTINEL) or not has_refresh
+    authorized_at, days_used, days_left = token_health(tok)
     if authorized_at:
-        out("authorized:  %s (%.1f days ago)"
-            % (time.strftime("%F %T", time.localtime(authorized_at)), days_used))
-        out("6-month wall: %s (%.0f days left)"
-            % (time.strftime("%F", time.localtime(
-                   authorized_at + REFRESH_TOKEN_LIFETIME_DAYS * 86400)),
-               days_left))
+        lines.append("authorized:  %s (%.1f days ago)"
+                     % (time.strftime("%F %T", time.localtime(authorized_at)), days_used))
+        lines.append("6-month wall: %s (%.0f days left)"
+                     % (time.strftime("%F", time.localtime(
+                            authorized_at + REFRESH_TOKEN_LIFETIME_DAYS * 86400)),
+                        days_left))
         if days_left <= 0:
             needs_reauth = True
 
     if os.path.exists(SENTINEL):
         with open(SENTINEL) as fh:
-            out("SENTINEL:    %s" % fh.read().strip())
+            lines.append("SENTINEL:    %s" % fh.read().strip())
 
-    # Proactive 6-month-wall reminder (used by the daily timer with --alert).
+    if probe and has_refresh:
+        try:
+            access = get_access_token(cfg)
+            scode, devs = http_request("GET", API + "/me/player/devices",
+                                       token=access)
+            names = [d.get("name") for d in devs.get("devices", [])] \
+                if isinstance(devs, dict) else []
+            lines.append("devices:     %s" % (", ".join(n for n in names if n) or "(none)"))
+            target = cfg.get("DEVICE_NAME", "Web Player (Chrome)")
+            lines.append("kiosk dev:   %s" % ("present" if target in names else "ABSENT"))
+            lines.append("now playing: %s" % now_playing_text(cfg))
+        except (AuthNeeded, Transient) as exc:
+            lines.append("probe:       failed (%s)" % exc)
+
+    return lines, needs_reauth
+
+
+def cmd_status(args):
+    cfg = load_config()
+    lines, needs_reauth = status_report(cfg, probe=args.probe)
+    if not args.quiet:
+        for line in lines:
+            print(line)
+
+    # Proactive reminders (used by the daily timer with --alert).
+    tok = read_json(TOKEN_FILE, {})
+    authorized_at, days_used, days_left = token_health(tok)
     if args.alert and authorized_at and 0 < days_left <= REAUTH_WARN_DAYS:
         alert("Spotify refresh token on %s expires in %.0f days (6-month wall, "
               "%s). Re-auth soon: spotify-auto reauth"
@@ -683,19 +710,6 @@ def cmd_status(args):
         alert("Spotify on %s still needs re-auth: %s" % (hostname(), reason),
               key="auth-needed", min_interval=20 * 3600, cfg=cfg)
 
-    if args.probe and has_refresh:
-        try:
-            access = get_access_token(cfg)
-            scode, devs = http_request("GET", API + "/me/player/devices",
-                                       token=access)
-            names = [d.get("name") for d in devs.get("devices", [])] \
-                if isinstance(devs, dict) else []
-            out("devices:     %s" % (", ".join(n for n in names if n) or "(none)"))
-            target = cfg.get("DEVICE_NAME", "Web Player (Chrome)")
-            out("kiosk dev:   %s" % ("present" if target in names else "ABSENT"))
-        except (AuthNeeded, Transient) as exc:
-            out("probe:       failed (%s)" % exc)
-
     return 4 if needs_reauth else 0
 
 
@@ -703,30 +717,25 @@ def cmd_status(args):
 # Subcommand: now-playing
 # --------------------------------------------------------------------------- #
 
-def cmd_now_playing(args):
-    cfg = load_config()
+def now_playing_text(cfg):
+    """Return a one-line description of current playback (never raises)."""
     try:
         access = get_access_token(cfg)
     except AuthNeeded:
-        print("(re-auth needed)")
-        return 0
+        return "(re-auth needed)"
     except Transient:
-        print("(error: token refresh failed)")
-        return 0
+        return "(error: token refresh failed)"
 
     status, body = http_request("GET", API + "/me/player/currently-playing",
                                 token=access)
     if status in (204, None) or not body:
-        print("(nothing playing)")
-        return 0
+        return "(nothing playing)"
     if status != 200:
-        print("(error: HTTP %s)" % status)
-        return 0
+        return "(error: HTTP %s)" % status
 
     item = body.get("item")
     if not item:
-        print("(nothing playing)")
-        return 0
+        return "(nothing playing)"
     if item.get("type") == "episode":
         show = (item.get("show") or {}).get("name", "Unknown show")
         text = "%s — %s" % (show, item.get("name", "Unknown episode"))
@@ -735,7 +744,11 @@ def cmd_now_playing(args):
         text = "%s — %s" % (artists, item.get("name", "Unknown track"))
     if not body.get("is_playing", False):
         text += "  [paused]"
-    print(text)
+    return text
+
+
+def cmd_now_playing(args):
+    print(now_playing_text(load_config()))
     return 0
 
 
@@ -977,6 +990,244 @@ def _notify_setup(cfg):
 
 
 # --------------------------------------------------------------------------- #
+# Subcommand: bot (Telegram command interface, long-poll getUpdates)
+# --------------------------------------------------------------------------- #
+
+BOT_OFFSET_FILE = os.path.join(CONFIG_DIR, "bot-offset.json")
+BOT_REAUTH_TIMEOUT = 300
+
+BOT_COMMANDS = [
+    ("status", "token / device health (add 'detailed' for a live probe)"),
+    ("nowplaying", "what is playing right now"),
+    ("resume", "play the configured context if the kiosk is idle"),
+    ("restart", "restart the kiosk service"),
+    ("reauth", "re-authorize Spotify (I send you an approval link)"),
+    ("health", "quick liveness check"),
+    ("log", "tail the spotify-auto log (optional line count, e.g. /log 40)"),
+    ("help", "list commands"),
+]
+
+
+def _html_escape(s):
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _pre(text):
+    """Wrap monospace output for Telegram parse_mode=HTML."""
+    return "<pre>%s</pre>" % _html_escape(text)
+
+
+def _tail_lines(path, n, max_bytes=16384):
+    """Return the last `n` lines of `path` without reading the whole file."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - max_bytes))
+            data = fh.read()
+    except FileNotFoundError:
+        return ["(no log file yet: %s)" % path]
+    except OSError as exc:
+        return ["(cannot read log: %s)" % exc]
+    lines = data.decode("utf-8", "replace").splitlines()
+    if size > max_bytes and len(lines) > 1:
+        lines = lines[1:]              # drop the partial first line
+    return lines[-n:] if lines else ["(log is empty)"]
+
+
+def _kiosk_active():
+    return subprocess.run(
+        ["systemctl", "--user", "is-active", "--quiet", "spotify-kiosk.service"]
+    ).returncode == 0
+
+
+def _bot_help():
+    lines = ["spotify-auto bot — commands:"]
+    for cmd, desc in BOT_COMMANDS:
+        lines.append("  /%-11s %s" % (cmd, desc))
+    return _pre("\n".join(lines))
+
+
+def _bot_health(cfg):
+    tok = read_json(TOKEN_FILE, {})
+    _, _, days_left = token_health(tok)
+    lines = ["host:   %s" % hostname(),
+             "kiosk:  %s" % ("active" if _kiosk_active() else "inactive")]
+    if os.path.exists(SENTINEL):
+        lines.append("auth:   RE-AUTH NEEDED")
+    elif days_left is not None:
+        lines.append("auth:   ok (%.0f days to 6-month wall)" % days_left)
+    else:
+        lines.append("auth:   no token stored")
+    return "\n".join(lines)
+
+
+def _bot_reauth(cfg, send, reauth_lock):
+    """Drive `reauth --remote` as a subprocess, relaying the link via Telegram."""
+    if not reauth_lock.acquire(blocking=False):
+        send("re-auth already in progress.")
+        return
+
+    def worker():
+        try:
+            send("Starting re-auth. I'll send you a link to approve shortly...")
+            script = os.path.realpath(__file__)
+            try:
+                proc = subprocess.Popen(
+                    [sys.executable, script, "reauth", "--remote",
+                     "--no-browser", "--timeout", str(BOT_REAUTH_TIMEOUT)],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            except OSError as exc:
+                send("could not start re-auth: %s" % exc)
+                return
+            tail, url_sent = [], False
+            for line in proc.stdout:
+                tail.append(line.rstrip("\n"))
+                if not url_sent and "accounts.spotify.com/authorize" in line:
+                    send("Open this link on this device and approve access:\n\n%s"
+                         % line.strip())
+                    url_sent = True
+            proc.wait()
+            if proc.returncode == 0:
+                done = next((l for l in reversed(tail) if "valid until" in l),
+                            "Re-authorized.")
+                send("Re-authorized OK. %s" % done.strip())
+            else:
+                msg = "\n".join(tail[-5:]) or "unknown error"
+                send("Re-auth %s:\n%s"
+                     % ("failed before a link was produced" if not url_sent
+                        else "failed", msg))
+        finally:
+            reauth_lock.release()
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def _bot_dispatch(cfg, text, send, reauth_lock):
+    parts = text.split()
+    cmd = parts[0].lstrip("/").lower()
+    if "@" in cmd:                       # strip @botname in group mentions
+        cmd = cmd.split("@", 1)[0]
+    arg = parts[1].lower() if len(parts) > 1 else ""
+
+    if cmd in ("help", "start"):
+        send(_bot_help(), html=True)
+    elif cmd == "status":
+        detailed = arg in ("detailed", "full", "-v", "v")
+        lines, _ = status_report(cfg, probe=detailed)
+        send(_pre("\n".join(lines)), html=True)
+    elif cmd in ("nowplaying", "np"):
+        send(_pre(now_playing_text(cfg)), html=True)
+    elif cmd in ("health", "ping"):
+        send(_pre(_bot_health(cfg)), html=True)
+    elif cmd in ("log", "logs"):
+        n = max(1, min(int(arg), 60)) if arg.isdigit() else 20
+        body = "\n".join(_tail_lines(LOG_FILE, n))
+        if len(body) > 3500:             # keep well under Telegram's 4096 limit
+            body = "...(truncated)...\n" + body[-3500:]
+        send(_pre(body), html=True)
+    elif cmd == "resume":
+        send("resuming...")
+        rc = cmd_auto_resume(argparse.Namespace())
+        send("resume done (exit %d)" % rc)
+    elif cmd == "restart":
+        send("restarting kiosk...")
+        rc = subprocess.run(
+            ["systemctl", "--user", "restart", "spotify-kiosk.service"]).returncode
+        send("kiosk restart %s (exit %d)" % ("ok" if rc == 0 else "FAILED", rc))
+    elif cmd == "reauth":
+        _bot_reauth(cfg, send, reauth_lock)
+    else:
+        send("unknown command. Send /help.")
+
+
+def cmd_bot(args):
+    cfg = load_config()
+    require(cfg, "CLIENT_ID")
+    token = cfg.get("TELEGRAM_BOT_TOKEN")
+    owner = cfg.get("TELEGRAM_CHAT_ID")
+    if not token or not owner:
+        fail("bot needs TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID "
+             "(run: spotify-auto notify --setup)")
+    allow = {str(owner)}
+    poll = int(cfg.get("BOT_POLL_TIMEOUT", "50"))
+    reauth_lock = threading.Lock()
+
+    def send(text, html=False):
+        _telegram_send(text, cfg, parse_mode=("HTML" if html else None), chat=owner)
+
+    # A webhook would make getUpdates fail with 409; clear it defensively.
+    _telegram_api(token, "deleteWebhook")
+    if not args.no_set_commands:
+        _telegram_api(token, "setMyCommands", {
+            "commands": json.dumps(
+                [{"command": c, "description": d} for c, d in BOT_COMMANDS])})
+
+    offset = read_json(BOT_OFFSET_FILE, {}).get("offset", 0)
+    log("bot: started (poll=%ds, owner=%s, offset=%d)" % (poll, owner, offset))
+    backoff = 1
+    timeouts = 0          # consecutive benign long-poll timeouts
+    while True:
+        try:
+            status, body = _telegram_api(
+                token, "getUpdates",
+                {"offset": offset, "timeout": poll,
+                 "allowed_updates": json.dumps(["message"])},
+                # Socket window must comfortably exceed the long-poll timeout so
+                # a slightly-late response is not clipped as a timeout.
+                timeout=poll + 20)
+        except Exception as exc:                      # never let the loop die
+            log("bot: getUpdates error: %s" % exc)
+            time.sleep(min(backoff, 60))
+            backoff = min(backoff * 2, 60)
+            continue
+
+        if status is None:
+            # A long-poll that delivers nothing in time is normal and benign
+            # (transient network hiccup) — indistinguishable from "no messages".
+            # Re-poll right away; only warn if it persists (a real outage).
+            timeouts += 1
+            if timeouts == 5 or timeouts % 30 == 0:
+                log("bot: getUpdates network timeout x%d (%s)"
+                    % (timeouts, body.get("_neterror", "")))
+            time.sleep(1)
+            continue
+        timeouts = 0
+
+        if status != 200 or not isinstance(body, dict) or not body.get("ok"):
+            log("bot: getUpdates HTTP error: status=%s body=%s" % (status, body))
+            time.sleep(min(backoff, 60))
+            backoff = min(backoff * 2, 60)
+            continue
+        backoff = 1
+
+        for upd in body.get("result", []):
+            offset = upd["update_id"] + 1
+            try:
+                write_json_atomic(BOT_OFFSET_FILE, {"offset": offset})
+            except OSError:
+                pass
+            msg = upd.get("message") or {}
+            chat = str((msg.get("chat") or {}).get("id", ""))
+            text = (msg.get("text") or "").strip()
+            if chat not in allow:
+                log("bot: ignoring message from unauthorized chat %s" % chat)
+                continue
+            if not text:
+                continue
+            log("bot: command from %s: %s" % (chat, text))
+            try:
+                _bot_dispatch(cfg, text, send, reauth_lock)
+            except SystemExit as exc:        # a handler hit fail()/require()
+                log("bot: command exited (%s)" % exc)
+                send("command failed (see spotify-auto log)")
+            except Exception as exc:
+                log("bot: handler error: %s" % exc)
+                send("internal error handling that command")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 # Argument parsing / dispatch
 # --------------------------------------------------------------------------- #
 
@@ -1023,6 +1274,12 @@ def build_parser():
     sp.add_argument("--setup", action="store_true", help="configure Telegram")
     sp.add_argument("--test", action="store_true", help="send a test alert")
     sp.set_defaults(func=cmd_notify)
+
+    sp = sub.add_parser("bot",
+                        help="run the Telegram command bot (long-poll daemon)")
+    sp.add_argument("--no-set-commands", action="store_true",
+                    help="do not register the slash-command menu on startup")
+    sp.set_defaults(func=cmd_bot)
 
     return p
 
