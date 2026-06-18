@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the spotify-kiosk watchdog every 5 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=15s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

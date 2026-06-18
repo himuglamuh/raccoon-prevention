@@ -1,0 +1,6 @@
+[Unit]
+Description=Spotify kiosk watchdog (probe DevTools + Spotify Connect device)
+
+[Service]
+Type=oneshot
+ExecStart=%h/bin/spotify-auto watchdog

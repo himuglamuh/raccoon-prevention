@@ -1,0 +1,6 @@
+[Unit]
+Description=Spotify auto-resume (play the configured context if the kiosk is idle)
+
+[Service]
+Type=oneshot
+ExecStart=%h/bin/spotify-auto auto-resume

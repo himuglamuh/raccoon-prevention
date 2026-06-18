@@ -1,0 +1,14 @@
+[Unit]
+Description=Run spotify-auto auto-resume every 4 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=4min
+# Jitter so we never fire on an exact even-minute boundary (replaces the old
+# `sleep $((RANDOM % 40))` at the top of the cron script).
+RandomizedDelaySec=40s
+AccuracySec=10s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

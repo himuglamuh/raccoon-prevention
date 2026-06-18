@@ -1,0 +1,1040 @@
+#!/usr/bin/env python3
+"""spotify-auto — keep a headless Spotify web-player kiosk playing, safely.
+
+A single dependency-free (Python 3 standard library only) CLI that replaces a
+pile of bash scripts which each embedded a long-lived Spotify client secret and
+refresh token in plaintext.
+
+Design goals
+------------
+* PKCE authorization-code flow: the tooling never needs a client *secret*.
+* Refresh tokens are stored in one 0600 file and rotated atomically. Spotify
+  rotates the refresh token on every refresh; concurrent refreshes would race
+  and invalidate each other, so all token access is serialized with flock and
+  access tokens are cached until ~60s before expiry.
+* Spotify (as of 2026) expires a refresh token 6 months after authorization,
+  and refreshing does NOT extend that. On `invalid_grant` we drop into a
+  "needs re-auth" state (sentinel file + alert) instead of silently dying, and
+  we proactively warn before the 6-month wall is hit.
+* Alerts go to the log, a sentinel file, the desktop (notify-send) and Telegram.
+
+Subcommands: token | reauth | status | now-playing | auto-resume | watchdog | notify
+
+Configuration lives OUTSIDE this (public) repo, in
+  ~/.config/spotify-auto/config.env   (0600, see config.env.example)
+and runtime state in
+  ~/.config/spotify-auto/{token.json,auth-needed,alert-state.json,.lock}
+"""
+
+import argparse
+import base64
+import fcntl
+import hashlib
+import http.server
+import json
+import os
+import random
+import secrets
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+# --------------------------------------------------------------------------- #
+# Paths & constants
+# --------------------------------------------------------------------------- #
+
+CONFIG_DIR = os.environ.get("SPOTIFY_AUTO_CONFIG_DIR") or os.path.expanduser(
+    "~/.config/spotify-auto"
+)
+CONFIG_ENV = os.path.join(CONFIG_DIR, "config.env")
+TOKEN_FILE = os.path.join(CONFIG_DIR, "token.json")
+LOCK_FILE = os.path.join(CONFIG_DIR, ".lock")
+SENTINEL = os.path.join(CONFIG_DIR, "auth-needed")
+ALERT_STATE = os.path.join(CONFIG_DIR, "alert-state.json")
+LOG_FILE = os.path.expanduser("~/.local/state/spotify-auto.log")
+
+AUTH_URL = "https://accounts.spotify.com/authorize"
+TOKEN_URL = "https://accounts.spotify.com/api/token"
+API = "https://api.spotify.com/v1"
+
+DEFAULT_SCOPES = (
+    "user-read-playback-state user-modify-playback-state "
+    "user-read-currently-playing"
+)
+# Spotify: refresh tokens expire 6 months after authorization; refreshing does
+# not extend this. We warn before the wall so a human can re-auth in time.
+REFRESH_TOKEN_LIFETIME_DAYS = 180
+REAUTH_WARN_DAYS = 14
+
+HTTP_TIMEOUT = 15
+
+
+class AuthNeeded(Exception):
+    """Refresh token is dead/missing — a human must re-authorize."""
+
+
+class Transient(Exception):
+    """A temporary failure (network, 5xx, rate limit). Retry later."""
+
+
+# --------------------------------------------------------------------------- #
+# Small utilities
+# --------------------------------------------------------------------------- #
+
+def hostname():
+    try:
+        return socket.gethostname()
+    except OSError:
+        return "pi"
+
+
+def log(msg):
+    line = "%s %s" % (time.strftime("%F %T"), msg)
+    try:
+        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+        with open(LOG_FILE, "a") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
+    print(line, file=sys.stderr)
+
+
+def read_json(path, default=None):
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        return {} if default is None else default
+    except (json.JSONDecodeError, OSError):
+        return {} if default is None else default
+
+
+def write_json_atomic(path, data, mode=0o600):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(data, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+class Lock:
+    """Exclusive flock across all spotify-auto invocations."""
+
+    def __init__(self, path=LOCK_FILE):
+        self.path = path
+        self.fd = None
+
+    def __enter__(self):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        self.fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+        finally:
+            os.close(self.fd)
+        return False
+
+
+def load_config():
+    """Parse the shell-style config.env into a dict (no shell execution)."""
+    cfg = {}
+    try:
+        with open(CONFIG_ENV) as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[len("export "):].lstrip()
+                if "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                key = key.strip()
+                val = val.strip()
+                if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+                    val = val[1:-1]
+                cfg[key] = val
+    except FileNotFoundError:
+        pass
+    return cfg
+
+
+def set_config_values(updates):
+    """Create/update KEY=value lines in config.env, preserving the rest."""
+    lines = []
+    if os.path.exists(CONFIG_ENV):
+        with open(CONFIG_ENV) as fh:
+            lines = fh.read().splitlines()
+    remaining = dict(updates)
+    out = []
+    for line in lines:
+        stripped = line.strip()
+        handled = False
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            key = stripped.split("=", 1)[0].strip()
+            if key in remaining:
+                out.append("%s=%s" % (key, remaining.pop(key)))
+                handled = True
+        if not handled:
+            out.append(line)
+    for key, val in remaining.items():
+        out.append("%s=%s" % (key, val))
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    tmp = CONFIG_ENV + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write("\n".join(out) + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, CONFIG_ENV)
+
+
+def require(cfg, *keys):
+    missing = [k for k in keys if not cfg.get(k)]
+    if missing:
+        fail("config.env missing required key(s): %s (see %s)"
+             % (", ".join(missing), CONFIG_ENV))
+
+
+def fail(msg, code=1):
+    log("ERROR: " + msg)
+    sys.exit(code)
+
+
+# --------------------------------------------------------------------------- #
+# HTTP (urllib only)
+# --------------------------------------------------------------------------- #
+
+def http_request(method, url, token=None, json_body=None, form=None,
+                 timeout=HTTP_TIMEOUT):
+    """Return (status_or_None, parsed_body). status None == network error.
+
+    parsed_body is a dict (JSON), {"_raw": text} for non-JSON, or {} for empty.
+    """
+    headers = {"Accept": "application/json"}
+    data = None
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    if json_body is not None:
+        data = json.dumps(json_body).encode()
+        headers["Content-Type"] = "application/json"
+    elif form is not None:
+        data = urllib.parse.urlencode(form).encode()
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    elif method in ("POST", "PUT", "DELETE"):
+        data = b""  # force Content-Length: 0 for body-less writes (repeat/volume)
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+
+    def parse(text):
+        if not text:
+            return {}
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return {"_raw": text}
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8", "replace")
+            return resp.status, parse(body)
+    except urllib.error.HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", "replace")
+        except Exception:
+            pass
+        return exc.code, parse(body)
+    except (urllib.error.URLError, socket.timeout, OSError) as exc:
+        return None, {"_neterror": str(exc)}
+
+
+# --------------------------------------------------------------------------- #
+# Alerts: log + sentinel + desktop + Telegram (with per-key throttling)
+# --------------------------------------------------------------------------- #
+
+def _notify_send(msg):
+    if not _which("notify-send"):
+        return
+    env = dict(os.environ)
+    env.setdefault("DISPLAY", ":0")
+    uid = os.getuid()
+    env.setdefault("DBUS_SESSION_BUS_ADDRESS",
+                   "unix:path=/run/user/%d/bus" % uid)
+    try:
+        subprocess.run(["notify-send", "-a", "spotify-auto", "Spotify auto", msg],
+                       env=env, timeout=10, check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _telegram_send(msg, cfg):
+    bot = cfg.get("TELEGRAM_BOT_TOKEN")
+    chat = cfg.get("TELEGRAM_CHAT_ID")
+    if not bot or not chat:
+        return False
+    url = "https://api.telegram.org/bot%s/sendMessage" % bot
+    status, body = http_request(
+        "POST", url,
+        form={"chat_id": chat, "text": msg, "disable_notification": "false"})
+    if status == 200:
+        return True
+    log("telegram send failed: status=%s body=%s" % (status, body))
+    return False
+
+
+def _which(name):
+    for path in os.environ.get("PATH", "").split(os.pathsep):
+        candidate = os.path.join(path, name)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def alert(msg, key="generic", min_interval=3600, cfg=None):
+    """Fire an alert through every channel, throttled per `key`."""
+    if cfg is None:
+        cfg = load_config()
+    now = time.time()
+    state = read_json(ALERT_STATE, {})
+    if min_interval and now - state.get(key, 0) < min_interval:
+        log("alert[%s] throttled: %s" % (key, msg))
+        return False
+    state[key] = now
+    try:
+        write_json_atomic(ALERT_STATE, state)
+    except OSError:
+        pass
+    log("ALERT[%s]: %s" % (key, msg))
+    _notify_send(msg)
+    _telegram_send(msg, cfg)
+    return True
+
+
+def set_sentinel(reason, cfg=None):
+    try:
+        with open(SENTINEL, "w") as fh:
+            fh.write("%s %s\n" % (time.strftime("%F %T"), reason))
+        os.chmod(SENTINEL, 0o600)
+    except OSError:
+        pass
+    log("SENTINEL set: " + reason)
+    alert("Spotify re-auth needed on %s: %s\nRun: spotify-auto reauth"
+          % (hostname(), reason),
+          key="auth-needed", min_interval=6 * 3600, cfg=cfg)
+
+
+def clear_sentinel():
+    if os.path.exists(SENTINEL):
+        try:
+            os.unlink(SENTINEL)
+            log("SENTINEL cleared")
+        except OSError:
+            pass
+
+
+# --------------------------------------------------------------------------- #
+# Token management
+# --------------------------------------------------------------------------- #
+
+def get_access_token(cfg, force_refresh=False):
+    """Return a valid access token, refreshing (and rotating) under lock.
+
+    Raises AuthNeeded if the refresh token is dead/missing, Transient on
+    temporary errors.
+    """
+    require(cfg, "CLIENT_ID")
+    with Lock():
+        tok = read_json(TOKEN_FILE, {})
+        refresh = tok.get("refresh_token")
+        if not refresh:
+            raise AuthNeeded("no stored refresh token")
+
+        now = time.time()
+        if (not force_refresh and tok.get("access_token")
+                and tok.get("access_expires_at", 0) - now > 60):
+            return tok["access_token"]
+
+        status, body = http_request("POST", TOKEN_URL, form={
+            "grant_type": "refresh_token",
+            "refresh_token": refresh,
+            "client_id": cfg["CLIENT_ID"],
+        })
+
+        if status == 200 and isinstance(body, dict) and body.get("access_token"):
+            tok["access_token"] = body["access_token"]
+            tok["access_expires_at"] = now + int(body.get("expires_in", 3600))
+            tok["last_refresh"] = now
+            if body.get("refresh_token"):       # rotation — persist immediately
+                tok["refresh_token"] = body["refresh_token"]
+            if body.get("scope"):
+                tok["scope"] = body["scope"]
+            write_json_atomic(TOKEN_FILE, tok)
+            clear_sentinel()
+            return tok["access_token"]
+
+        if status == 400 and isinstance(body, dict) and \
+                body.get("error") == "invalid_grant":
+            set_sentinel("invalid_grant (%s)"
+                         % body.get("error_description", "refresh token rejected"),
+                         cfg=cfg)
+            raise AuthNeeded("invalid_grant")
+
+        raise Transient("token refresh failed: status=%s body=%s"
+                        % (status, body))
+
+
+def token_health(tok):
+    """Return (authorized_at, days_used, days_left) or (None, None, None)."""
+    authorized_at = tok.get("authorized_at")
+    if not authorized_at:
+        return None, None, None
+    days_used = (time.time() - authorized_at) / 86400.0
+    days_left = REFRESH_TOKEN_LIFETIME_DAYS - days_used
+    return authorized_at, days_used, days_left
+
+
+# --------------------------------------------------------------------------- #
+# PKCE helpers
+# --------------------------------------------------------------------------- #
+
+def pkce_pair():
+    verifier = base64.urlsafe_b64encode(secrets.token_bytes(64)).rstrip(b"=").decode()
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+    return verifier, challenge
+
+
+# --------------------------------------------------------------------------- #
+# Subcommand: reauth (interactive PKCE)
+# --------------------------------------------------------------------------- #
+
+def cmd_reauth(args):
+    cfg = load_config()
+    require(cfg, "CLIENT_ID")
+    client_id = cfg["CLIENT_ID"]
+    scopes = cfg.get("SCOPES", DEFAULT_SCOPES)
+
+    if args.remote:
+        redirect_uri = cfg.get("REMOTE_REDIRECT_URI")
+        if not redirect_uri:
+            host = cfg.get("TAILSCALE_HOST")
+            if not host:
+                fail("remote reauth needs REMOTE_REDIRECT_URI or TAILSCALE_HOST "
+                     "in config.env")
+            redirect_uri = "https://%s/callback" % host
+        listen_port = int(cfg.get("REMOTE_LISTEN_PORT", "8080"))
+    else:
+        redirect_uri = cfg.get("REDIRECT_URI", "http://127.0.0.1:8080/callback")
+        parsed = urllib.parse.urlparse(redirect_uri)
+        listen_port = parsed.port or 8080
+
+    callback_path = urllib.parse.urlparse(redirect_uri).path or "/callback"
+    verifier, challenge = pkce_pair()
+    state = secrets.token_urlsafe(24)
+
+    auth_link = AUTH_URL + "?" + urllib.parse.urlencode({
+        "client_id": client_id,
+        "response_type": "code",
+        "redirect_uri": redirect_uri,
+        "scope": scopes,
+        "code_challenge_method": "S256",
+        "code_challenge": challenge,
+        "state": state,
+    })
+
+    result = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _html(self, code, message):
+            self.send_response(code)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(
+                ("<html><body style='font-family:sans-serif;max-width:30em;"
+                 "margin:4em auto'><h2>%s</h2><p>spotify-auto</p></body></html>"
+                 % message).encode())
+
+        def do_GET(self):
+            parts = urllib.parse.urlparse(self.path)
+            if parts.path != callback_path:
+                self._html(404, "Not found")
+                return
+            qs = urllib.parse.parse_qs(parts.query)
+            if qs.get("state", [None])[0] != state:
+                result["error"] = "state mismatch (possible CSRF)"
+                self._html(400, "State mismatch. Aborted.")
+            elif "error" in qs:
+                result["error"] = qs["error"][0]
+                self._html(400, "Authorization denied: %s" % qs["error"][0])
+            elif "code" in qs:
+                result["code"] = qs["code"][0]
+                self._html(200, "Authorized! You can close this tab.")
+            else:
+                result["error"] = "no code in callback"
+                self._html(400, "Missing authorization code.")
+            threading.Thread(target=self.server.shutdown, daemon=True).start()
+
+    try:
+        httpd = http.server.HTTPServer(("127.0.0.1", listen_port), Handler)
+    except OSError as exc:
+        fail("cannot bind 127.0.0.1:%d (%s). Is another reauth running, or the "
+             "kiosk using the port?" % (listen_port, exc))
+
+    serve_reset_needed = False
+    if args.remote:
+        print("Exposing the callback over Tailscale Serve (HTTPS)...")
+        sys.stdout.flush()
+        try:
+            rc = subprocess.run(["tailscale", "serve", "--bg", str(listen_port)])
+            if rc.returncode != 0:
+                rc = subprocess.run(
+                    ["sudo", "tailscale", "serve", "--bg", str(listen_port)])
+        except FileNotFoundError:
+            httpd.server_close()
+            fail("`tailscale` not found. Install Tailscale or run reauth on the Pi.")
+        if rc.returncode != 0:
+            httpd.server_close()
+            fail("`tailscale serve --bg %d` failed. Run it manually, then retry."
+                 % listen_port)
+        serve_reset_needed = True
+
+    def timeout_killer():
+        time.sleep(args.timeout)
+        result.setdefault("error", "timed out waiting for the callback")
+        httpd.shutdown()
+
+    threading.Thread(target=timeout_killer, daemon=True).start()
+
+    print()
+    print("=" * 70)
+    print("Open this URL and approve access:")
+    print()
+    print("  " + auth_link)
+    print()
+    if args.remote:
+        print("Open it on any device on your tailnet (e.g. your phone).")
+    else:
+        print("Open it in a browser ON THIS Pi (the redirect is loopback).")
+    print("=" * 70)
+    print()
+    # Surface the URL immediately: when stdout is a file/pipe it is block
+    # buffered, and serve_forever() below blocks before the buffer flushes.
+    sys.stdout.flush()
+
+    if not args.remote and not args.no_browser:
+        opener = _which("xdg-open") or _which("chromium") or _which("chromium-browser")
+        if opener:
+            try:
+                subprocess.Popen([opener, auth_link],
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+            except OSError:
+                pass
+
+    try:
+        print("Waiting for the Spotify redirect (timeout %ds)..." % args.timeout)
+        sys.stdout.flush()
+        httpd.serve_forever()
+    finally:
+        httpd.server_close()
+        if serve_reset_needed:
+            try:
+                if subprocess.run(["tailscale", "serve", "reset"],
+                                  stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL).returncode != 0:
+                    subprocess.run(["sudo", "tailscale", "serve", "reset"],
+                                   stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL)
+            except FileNotFoundError:
+                pass
+
+    if "code" not in result:
+        fail("re-auth failed: %s" % result.get("error", "no callback received"))
+
+    status, body = http_request("POST", TOKEN_URL, form={
+        "grant_type": "authorization_code",
+        "code": result["code"],
+        "redirect_uri": redirect_uri,
+        "client_id": client_id,
+        "code_verifier": verifier,
+    })
+    if status != 200 or not isinstance(body, dict) or not body.get("refresh_token"):
+        fail("token exchange failed: status=%s body=%s" % (status, body))
+
+    now = time.time()
+    tok = {
+        "refresh_token": body["refresh_token"],
+        "access_token": body.get("access_token", ""),
+        "access_expires_at": now + int(body.get("expires_in", 3600)),
+        "authorized_at": now,
+        "scope": body.get("scope", scopes),
+    }
+    with Lock():
+        write_json_atomic(TOKEN_FILE, tok)
+    clear_sentinel()
+    # reset the reauth reminder throttle so the next warning window fires
+    state_alerts = read_json(ALERT_STATE, {})
+    for k in ("auth-needed", "reauth-warn"):
+        state_alerts.pop(k, None)
+    try:
+        write_json_atomic(ALERT_STATE, state_alerts)
+    except OSError:
+        pass
+
+    print()
+    log("re-auth succeeded; new refresh token stored")
+    print("Re-authorized. Refresh token valid until ~%s (%d days)."
+          % (time.strftime("%F", time.localtime(now + REFRESH_TOKEN_LIFETIME_DAYS * 86400)),
+             REFRESH_TOKEN_LIFETIME_DAYS))
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# Subcommand: token (print a valid access token)
+# --------------------------------------------------------------------------- #
+
+def cmd_token(args):
+    cfg = load_config()
+    try:
+        access = get_access_token(cfg, force_refresh=args.force)
+    except AuthNeeded as exc:
+        fail("re-auth required (%s). Run: spotify-auto reauth" % exc, code=3)
+    except Transient as exc:
+        fail(str(exc), code=2)
+    print(access)
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# Subcommand: status
+# --------------------------------------------------------------------------- #
+
+def cmd_status(args):
+    cfg = load_config()
+    tok = read_json(TOKEN_FILE, {})
+    quiet = args.quiet
+
+    def out(msg):
+        if not quiet:
+            print(msg)
+
+    out("host:        %s" % hostname())
+    out("config dir:  %s" % CONFIG_DIR)
+    out("config.env:  %s" % ("present" if os.path.exists(CONFIG_ENV) else "MISSING"))
+    out("client id:   %s" % ("set" if cfg.get("CLIENT_ID") else "MISSING"))
+    out("context uri: %s" % cfg.get("CONTEXT_URI", "(unset)"))
+    out("device name: %s" % cfg.get("DEVICE_NAME", "(unset)"))
+    out("telegram:    %s" % ("configured"
+                             if cfg.get("TELEGRAM_BOT_TOKEN") and cfg.get("TELEGRAM_CHAT_ID")
+                             else "not configured"))
+
+    has_refresh = bool(tok.get("refresh_token"))
+    out("refresh tok: %s" % ("stored" if has_refresh else "MISSING"))
+
+    authorized_at, days_used, days_left = token_health(tok)
+    needs_reauth = os.path.exists(SENTINEL) or not has_refresh
+    if authorized_at:
+        out("authorized:  %s (%.1f days ago)"
+            % (time.strftime("%F %T", time.localtime(authorized_at)), days_used))
+        out("6-month wall: %s (%.0f days left)"
+            % (time.strftime("%F", time.localtime(
+                   authorized_at + REFRESH_TOKEN_LIFETIME_DAYS * 86400)),
+               days_left))
+        if days_left <= 0:
+            needs_reauth = True
+
+    if os.path.exists(SENTINEL):
+        with open(SENTINEL) as fh:
+            out("SENTINEL:    %s" % fh.read().strip())
+
+    # Proactive 6-month-wall reminder (used by the daily timer with --alert).
+    if args.alert and authorized_at and 0 < days_left <= REAUTH_WARN_DAYS:
+        alert("Spotify refresh token on %s expires in %.0f days (6-month wall, "
+              "%s). Re-auth soon: spotify-auto reauth"
+              % (hostname(), days_left,
+                 time.strftime("%F", time.localtime(
+                     authorized_at + REFRESH_TOKEN_LIFETIME_DAYS * 86400))),
+              key="reauth-warn", min_interval=20 * 3600, cfg=cfg)
+    if args.alert and os.path.exists(SENTINEL):
+        with open(SENTINEL) as fh:
+            reason = fh.read().strip()
+        alert("Spotify on %s still needs re-auth: %s" % (hostname(), reason),
+              key="auth-needed", min_interval=20 * 3600, cfg=cfg)
+
+    if args.probe and has_refresh:
+        try:
+            access = get_access_token(cfg)
+            scode, devs = http_request("GET", API + "/me/player/devices",
+                                       token=access)
+            names = [d.get("name") for d in devs.get("devices", [])] \
+                if isinstance(devs, dict) else []
+            out("devices:     %s" % (", ".join(n for n in names if n) or "(none)"))
+            target = cfg.get("DEVICE_NAME", "Web Player (Chrome)")
+            out("kiosk dev:   %s" % ("present" if target in names else "ABSENT"))
+        except (AuthNeeded, Transient) as exc:
+            out("probe:       failed (%s)" % exc)
+
+    return 4 if needs_reauth else 0
+
+
+# --------------------------------------------------------------------------- #
+# Subcommand: now-playing
+# --------------------------------------------------------------------------- #
+
+def cmd_now_playing(args):
+    cfg = load_config()
+    try:
+        access = get_access_token(cfg)
+    except AuthNeeded:
+        print("(re-auth needed)")
+        return 0
+    except Transient:
+        print("(error: token refresh failed)")
+        return 0
+
+    status, body = http_request("GET", API + "/me/player/currently-playing",
+                                token=access)
+    if status in (204, None) or not body:
+        print("(nothing playing)")
+        return 0
+    if status != 200:
+        print("(error: HTTP %s)" % status)
+        return 0
+
+    item = body.get("item")
+    if not item:
+        print("(nothing playing)")
+        return 0
+    if item.get("type") == "episode":
+        show = (item.get("show") or {}).get("name", "Unknown show")
+        text = "%s — %s" % (show, item.get("name", "Unknown episode"))
+    else:
+        artists = ", ".join(a.get("name", "") for a in item.get("artists", []))
+        text = "%s — %s" % (artists, item.get("name", "Unknown track"))
+    if not body.get("is_playing", False):
+        text += "  [paused]"
+    print(text)
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# Subcommand: auto-resume
+# --------------------------------------------------------------------------- #
+
+def _find_device(access, name):
+    scode, body = http_request("GET", API + "/me/player/devices", token=access)
+    if not isinstance(body, dict):
+        return None
+    for dev in body.get("devices", []):
+        if dev.get("name") == name and dev.get("type") == "Computer":
+            return dev.get("id")
+    return None
+
+
+def cmd_auto_resume(args):
+    cfg = load_config()
+    require(cfg, "CLIENT_ID", "CONTEXT_URI")
+    device_name = cfg.get("DEVICE_NAME", "Web Player (Chrome)")
+    context_uri = cfg["CONTEXT_URI"]
+    vol_min = int(cfg.get("HEARTBEAT_VOL_MIN", "20"))
+    vol_max = int(cfg.get("HEARTBEAT_VOL_MAX", "40"))
+
+    try:
+        access = get_access_token(cfg)
+    except AuthNeeded:
+        return 3   # sentinel + alert already raised
+    except Transient as exc:
+        log("auto-resume: %s" % exc)
+        return 2
+
+    dev_id = _find_device(access, device_name)
+    if not dev_id:
+        log("'%s' device not found; starting kiosk" % device_name)
+        subprocess.run(["systemctl", "--user", "start", "spotify-kiosk.service"],
+                       check=False)
+        time.sleep(30)
+        dev_id = _find_device(access, device_name)
+        if not dev_id:
+            log("'%s' still not found after start; giving up this cycle"
+                % device_name)
+            return 0
+
+    scode, player = http_request("GET", API + "/me/player", token=access)
+    is_idle = (not player) or (scode in (204, None)) or \
+        (isinstance(player, dict) and player.get("is_playing") is not True)
+    active_dev = player.get("device", {}).get("id") if isinstance(player, dict) else None
+    active_vol = player.get("device", {}).get("volume_percent") if isinstance(player, dict) else None
+
+    if is_idle:
+        log("idle detected; starting %s on %s" % (context_uri, dev_id))
+        http_request("PUT", API + "/me/player", token=access,
+                     json_body={"device_ids": [dev_id], "play": True})
+        time.sleep(2)
+        http_request("PUT", API + "/me/player/play?device_id=" + dev_id,
+                     token=access, json_body={"context_uri": context_uri})
+        http_request("PUT", API + "/me/player/repeat?state=context&device_id=" + dev_id,
+                     token=access)
+    elif active_dev == dev_id and active_vol is not None:
+        # Playing on our kiosk: occasional random-volume "heartbeat" so the
+        # session never looks stale to Spotify. Intentional behaviour — keep.
+        if random.randint(0, 3) == 0:
+            new_vol = random.randint(vol_min, vol_max)
+            time.sleep(random.randint(0, 20))
+            http_request("PUT", "%s/me/player/volume?volume_percent=%d&device_id=%s"
+                         % (API, new_vol, dev_id), token=access)
+            log("playing on kiosk; heartbeat vol=%d" % new_vol)
+        else:
+            log("playing on kiosk; skipping heartbeat this cycle")
+    else:
+        log("playback active elsewhere (%s); doing nothing" % active_dev)
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# Subcommand: watchdog
+# --------------------------------------------------------------------------- #
+
+def cmd_watchdog(args):
+    cfg = load_config()
+    threshold = int(cfg.get("WATCHDOG_THRESHOLD", "3"))
+    timeout = int(cfg.get("WATCHDOG_TIMEOUT", "5"))
+    devtools_url = cfg.get("DEVTOOLS_URL", "http://127.0.0.1:9222/json/version")
+    device_name = cfg.get("DEVICE_NAME", "Web Player (Chrome)")
+
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid())
+    state_dir = os.path.join(runtime, "spotify-auto-watchdog")
+    os.makedirs(state_dir, exist_ok=True)
+    f_devtools = os.path.join(state_dir, "devtools.fails")
+    f_spotify = os.path.join(state_dir, "spotify.fails")
+
+    active = subprocess.run(
+        ["systemctl", "--user", "is-active", "--quiet", "spotify-kiosk.service"]
+    ).returncode == 0
+    if not active:
+        log("watchdog: kiosk service not active, skipping")
+        for f in (f_devtools, f_spotify):
+            _rm(f)
+        return 0
+
+    def restart(reason):
+        log("watchdog: RESTARTING spotify-kiosk.service (%s)" % reason)
+        subprocess.run(["systemctl", "--user", "restart", "spotify-kiosk.service"],
+                       check=False)
+        for f in (f_devtools, f_spotify):
+            _rm(f)
+
+    def record_fail(path, label):
+        n = _read_int(path) + 1
+        _write_int(path, n)
+        log("watchdog: %s FAILED (%d/%d)" % (label, n, threshold))
+        if n >= threshold:
+            restart("%s threshold reached" % label)
+            return True
+        return False
+
+    def record_ok(path, label):
+        if os.path.exists(path):
+            log("watchdog: %s recovered after %d failure(s)" % (label, _read_int(path)))
+            _rm(path)
+
+    # Probe 1: DevTools endpoint (browser process alive & responsive).
+    scode, _ = http_request("GET", devtools_url, timeout=timeout)
+    if scode == 200:
+        record_ok(f_devtools, "devtools")
+    else:
+        if record_fail(f_devtools, "devtools"):
+            return 0
+
+    # Probe 2: Spotify Connect device presence. Token/network failures are
+    # INCONCLUSIVE (never restart the kiosk over an auth/internet outage).
+    try:
+        access = get_access_token(cfg)
+    except AuthNeeded:
+        log("watchdog: spotify probe inconclusive (re-auth needed)")
+        return 0
+    except Transient:
+        log("watchdog: spotify probe inconclusive (token refresh failed)")
+        return 0
+
+    scode, body = http_request("GET", API + "/me/player/devices",
+                               token=access, timeout=timeout)
+    if not isinstance(body, dict) or "devices" not in body:
+        log("watchdog: spotify probe inconclusive (api unreachable)")
+        return 0
+    present = any(d.get("name") == device_name for d in body["devices"])
+    if present:
+        record_ok(f_spotify, "spotify")
+    else:
+        record_fail(f_spotify, "spotify")
+    return 0
+
+
+def _rm(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _read_int(path):
+    try:
+        with open(path) as fh:
+            return int(fh.read().strip() or "0")
+    except (OSError, ValueError):
+        return 0
+
+
+def _write_int(path, n):
+    try:
+        with open(path, "w") as fh:
+            fh.write(str(n))
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------------------------- #
+# Subcommand: notify
+# --------------------------------------------------------------------------- #
+
+def cmd_notify(args):
+    cfg = load_config()
+    if args.setup:
+        return _notify_setup(cfg)
+    if args.test:
+        ok = alert("Test alert from spotify-auto on %s" % hostname(),
+                   key="test", min_interval=0, cfg=cfg)
+        print("sent" if ok else "no channels configured / failed")
+        return 0 if ok else 1
+    if args.message:
+        alert(args.message, key="manual", min_interval=0, cfg=cfg)
+        return 0
+    fail("nothing to do: pass a message, --test or --setup")
+
+
+def _notify_setup(cfg):
+    print("Telegram alert setup")
+    print("--------------------")
+    print("1. In Telegram, message @BotFather -> /newbot to create a bot and")
+    print("   copy its token, OR reuse an existing bot token.")
+    default = cfg.get("TELEGRAM_BOT_TOKEN", "")
+    prompt = "Bot token%s: " % (" [keep existing]" if default else "")
+    token = input(prompt).strip() or default
+    if not token:
+        fail("no bot token provided")
+
+    print("\n2. Now open a chat with your bot and send it any message "
+          "(e.g. 'hi').")
+    input("   Press Enter here AFTER you have sent the message...")
+
+    status, body = http_request(
+        "GET", "https://api.telegram.org/bot%s/getUpdates" % token)
+    chat_id = None
+    if status == 200 and isinstance(body, dict):
+        for upd in reversed(body.get("result", [])):
+            msg = upd.get("message") or upd.get("channel_post") or {}
+            chat = msg.get("chat") or {}
+            if chat.get("id") is not None:
+                chat_id = str(chat["id"])
+                break
+    if not chat_id:
+        print("Could not auto-detect a chat id (status=%s)." % status)
+        chat_id = input("Enter your Telegram chat id manually: ").strip()
+    if not chat_id:
+        fail("no chat id")
+
+    set_config_values({"TELEGRAM_BOT_TOKEN": token, "TELEGRAM_CHAT_ID": chat_id})
+    print("Saved TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to %s" % CONFIG_ENV)
+    cfg = load_config()
+    if _telegram_send("spotify-auto Telegram alerts are configured on %s."
+                      % hostname(), cfg):
+        print("Sent a confirmation message to your Telegram. Done.")
+    else:
+        print("Saved, but the confirmation message failed to send. "
+              "Double-check the token/chat id.")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# Argument parsing / dispatch
+# --------------------------------------------------------------------------- #
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="spotify-auto",
+        description="Keep a headless Spotify web-player kiosk playing, safely.")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("reauth", help="interactive PKCE (re-)authorization")
+    sp.add_argument("--remote", action="store_true",
+                    help="authorize from another device via Tailscale Serve HTTPS")
+    sp.add_argument("--no-browser", action="store_true",
+                    help="do not try to open a browser locally")
+    sp.add_argument("--timeout", type=int, default=300,
+                    help="seconds to wait for the callback (default 300)")
+    sp.set_defaults(func=cmd_reauth)
+
+    sp = sub.add_parser("token", help="print a valid access token")
+    sp.add_argument("--force", action="store_true", help="force a refresh")
+    sp.set_defaults(func=cmd_token)
+
+    sp = sub.add_parser("status", help="show token / device health")
+    sp.add_argument("--probe", action="store_true",
+                    help="also query Spotify for live device state")
+    sp.add_argument("--alert", action="store_true",
+                    help="fire reminders for the 6-month wall / pending re-auth")
+    sp.add_argument("--quiet", action="store_true",
+                    help="print nothing; just set exit code (for timers)")
+    sp.set_defaults(func=cmd_status)
+
+    sp = sub.add_parser("now-playing", help="print the current track")
+    sp.set_defaults(func=cmd_now_playing)
+
+    sp = sub.add_parser("auto-resume",
+                        help="play the configured context if the kiosk is idle")
+    sp.set_defaults(func=cmd_auto_resume)
+
+    sp = sub.add_parser("watchdog", help="probe & restart the kiosk if wedged")
+    sp.set_defaults(func=cmd_watchdog)
+
+    sp = sub.add_parser("notify", help="send an alert / configure Telegram")
+    sp.add_argument("message", nargs="?", help="message to send")
+    sp.add_argument("--setup", action="store_true", help="configure Telegram")
+    sp.add_argument("--test", action="store_true", help="send a test alert")
+    sp.set_defaults(func=cmd_notify)
+
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    try:
+        return args.func(args) or 0
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

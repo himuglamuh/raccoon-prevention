@@ -1,0 +1,6 @@
+[Unit]
+Description=Spotify token health check (6-month re-auth wall reminder + sentinel)
+
+[Service]
+Type=oneshot
+ExecStart=%h/bin/spotify-auto status --quiet --alert

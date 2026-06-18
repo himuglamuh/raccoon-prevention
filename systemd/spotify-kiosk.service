@@ -1,0 +1,20 @@
+[Unit]
+Description=Spotify Chromium Kiosk
+# labwc autostart does not reliably reach the user graphical-session.target on
+# this Pi, so we don't depend on it; start-spot.sh polls for a Wayland socket.
+
+# Avoid a tight restart loop that piles up tabs / sessions.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=%h/bin/start-spot.sh
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=20
+KillMode=mixed
+Environment=XDG_RUNTIME_DIR=%t
+
+[Install]
+WantedBy=default.target

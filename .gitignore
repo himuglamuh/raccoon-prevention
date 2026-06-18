@@ -1,0 +1,17 @@
+# Secrets and runtime state live ONLY in ~/.config/spotify-auto/ and must never
+# be committed. These patterns are defensive in case anything is ever copied
+# into the repo tree.
+config.env
+token.json
+auth-needed
+alert-state.json
+*.lock
+.lock
+*.log
+
+# Allow the example to be tracked despite the config.env rule above.
+!config/config.env.example
+
+# Python bytecode
+__pycache__/
+*.pyc

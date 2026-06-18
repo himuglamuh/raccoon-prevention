@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# now-playing — print the currently playing track ("Artist — Title").
+#
+# Thin shim around `spotify-auto now-playing`, kept as its own entrypoint
+# because marq-playing (and muscle memory) call it directly. Resolves the
+# sibling CLI via its real path so it works whether invoked directly from the
+# repo or through a symlink in ~/bin.
+exec "$(dirname "$(readlink -f "$0")")/spotify-auto" now-playing "$@"

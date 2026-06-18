@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# marq-playing — push the current Spotify track to an LED marquee over ssh.
+#
+# Manual tool: run by hand, or `--loop` to poll. Intentionally NOT scheduled.
+#
+# The marquee host/key are read from the (untracked) config so this public
+# repo carries no personal LAN details. Set in ~/.config/spotify-auto/config.env:
+#   MARQUEE_SSH_DEST=pi@marquee.lan
+#   MARQUEE_SSH_KEY=~/.ssh/marquee_key
+#   MARQUEE_INTERVAL=30
+set -u
+
+SELF_DIR="$(dirname "$(readlink -f "$0")")"
+NOW_PLAYING="${SELF_DIR}/now-playing"
+CONFIG_ENV="${SPOTIFY_AUTO_CONFIG_DIR:-$HOME/.config/spotify-auto}/config.env"
+
+# Pull a single KEY=value from config.env without sourcing it (values may
+# contain spaces/parens that bash would choke on).
+getcfg() {
+  [ -f "$CONFIG_ENV" ] || return 0
+  sed -n "s/^[[:space:]]*$1=//p" "$CONFIG_ENV" 2>/dev/null | tail -n1 \
+    | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'\$//"
+}
+
+INTERVAL="$(getcfg MARQUEE_INTERVAL)"; : "${INTERVAL:=30}"
+SSH_KEY="$(getcfg MARQUEE_SSH_KEY)";   : "${SSH_KEY:=$HOME/.ssh/marquee_key}"
+SSH_DEST="$(getcfg MARQUEE_SSH_DEST)"; : "${SSH_DEST:=pi@marquee.local}"
+SSH_KEY="${SSH_KEY/#\~/$HOME}"
+
+push() {
+  ssh -i "$SSH_KEY" \
+      -o BatchMode=yes \
+      -o ConnectTimeout=5 \
+      -o ServerAliveInterval=10 \
+      "$SSH_DEST" update-marquee "Now Playing: 🎵 $1 🎵"
+}
+
+once() {
+  local playing
+  playing=$("$NOW_PLAYING")
+  push "$playing"
+}
+
+loop() {
+  local last=""
+  local playing
+  trap 'echo "marq-playing: interrupted" >&2; exit 0' INT TERM
+  while true; do
+    playing=$("$NOW_PLAYING")
+    if [ "$playing" != "$last" ]; then
+      if ! push "$playing"; then
+        echo "marq-playing: ssh failed, exiting" >&2
+        exit 1
+      fi
+      last="$playing"
+    fi
+    sleep "$INTERVAL"
+  done
+}
+
+case "${1:-}" in
+  --loop) loop ;;
+  ""    ) once ;;
+  -h|--help)
+    cat <<EOF
+Usage: marq-playing [--loop]
+  (no args)  Push the current track to the marquee once.
+  --loop     Poll every ${INTERVAL}s; push only when the track changes.
+             Exits non-zero if the ssh push fails.
+
+Config (~/.config/spotify-auto/config.env):
+  MARQUEE_SSH_DEST, MARQUEE_SSH_KEY, MARQUEE_INTERVAL
+EOF
+    ;;
+  *)
+    echo "marq-playing: unknown argument '$1' (try --help)" >&2
+    exit 2
+    ;;
+esac

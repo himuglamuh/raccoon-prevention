@@ -1,0 +1,6 @@
+[Unit]
+Description=Nightly preventive restart of spotify-kiosk.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl --user restart spotify-kiosk.service
