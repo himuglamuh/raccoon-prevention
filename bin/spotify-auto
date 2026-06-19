@@ -28,6 +28,7 @@ and runtime state in
 
 import argparse
 import base64
+import calendar
 import fcntl
 import hashlib
 import http.server
@@ -65,7 +66,8 @@ API = "https://api.spotify.com/v1"
 
 DEFAULT_SCOPES = (
     "user-read-playback-state user-modify-playback-state "
-    "user-read-currently-playing"
+    "user-read-currently-playing user-read-recently-played "
+    "user-top-read"
 )
 # Spotify: refresh tokens expire 6 months after authorization; refreshing does
 # not extend this. We warn before the wall so a human can re-auth in time.
@@ -92,6 +94,23 @@ def hostname():
         return socket.gethostname()
     except OSError:
         return "pi"
+
+
+def system_uptime():
+    """Human-readable system uptime from /proc/uptime (Linux)."""
+    try:
+        with open("/proc/uptime") as fh:
+            secs = int(float(fh.read().split()[0]))
+    except (OSError, ValueError, IndexError):
+        return "(unknown)"
+    days, rem = divmod(secs, 86400)
+    hrs, rem = divmod(rem, 3600)
+    mins = rem // 60
+    if days:
+        return "%dd %02dh %02dm" % (days, hrs, mins)
+    if hrs:
+        return "%dh %02dm" % (hrs, mins)
+    return "%dm" % mins
 
 
 def log(msg):
@@ -637,11 +656,163 @@ def cmd_token(args):
 # Subcommand: status
 # --------------------------------------------------------------------------- #
 
+def _fmt_ms(ms):
+    """Milliseconds -> 'm:ss' (or 'h:mm:ss' for long items)."""
+    try:
+        secs = int(ms) // 1000
+    except (TypeError, ValueError):
+        return "?:??"
+    if secs >= 3600:
+        return "%d:%02d:%02d" % (secs // 3600, (secs % 3600) // 60, secs % 60)
+    return "%d:%02d" % (secs // 60, secs % 60)
+
+
+def _track_line(item):
+    """One-line 'artist - title' (or 'show - episode') for a player item."""
+    if not item:
+        return "(nothing)"
+    if item.get("type") == "episode":
+        show = (item.get("show") or {}).get("name", "Unknown show")
+        return "%s — %s" % (show, item.get("name", "Unknown episode"))
+    artists = ", ".join(a.get("name", "") for a in item.get("artists", []))
+    return "%s — %s" % (artists, item.get("name", "Unknown track"))
+
+
+def playback_lines(cfg, access):
+    """Rich current-playback detail from GET /me/player. Returns list of str.
+
+    Uses only the already-granted user-read-playback-state scope. The Spotify
+    Web API exposes no cumulative "session" stats (listening time, play counts);
+    this is the live snapshot it does provide.
+    """
+    status, body = http_request("GET", API + "/me/player", token=access)
+    if status in (204, None) or not isinstance(body, dict) or not body:
+        return ["now playing: (nothing playing)"]
+    if status != 200:
+        return ["now playing: (error: HTTP %s)" % status]
+    item = body.get("item") or {}
+    state = "playing" if body.get("is_playing") else "paused"
+    lines = ["now playing: %s [%s]" % (_track_line(item), state)]
+    prog, dur = body.get("progress_ms"), item.get("duration_ms")
+    if dur and prog is not None:
+        lines.append("progress:    %s / %s (%.0f%%)"
+                     % (_fmt_ms(prog), _fmt_ms(dur), prog / dur * 100))
+    lines.append("shuffle:     %s    repeat: %s"
+                 % ("on" if body.get("shuffle_state") else "off",
+                    body.get("repeat_state", "?")))
+    dev = body.get("device") or {}
+    vol = dev.get("volume_percent")
+    lines.append("active dev:  %s%s"
+                 % (dev.get("name", "(unknown)"),
+                    "  vol %d%%" % vol if vol is not None else ""))
+    ctx = (body.get("context") or {}).get("uri")
+    if ctx:
+        tag = "  (configured)" if ctx == cfg.get("CONTEXT_URI") else ""
+        lines.append("context:     %s%s" % (ctx, tag))
+    upnext = queue_line(access)
+    if upnext:
+        lines.append("up next:     %s" % upnext)
+    return lines
+
+
+def queue_line(access):
+    """Next few queued items from GET /me/player/queue (in-scope). str or None."""
+    status, body = http_request("GET", API + "/me/player/queue", token=access)
+    if status != 200 or not isinstance(body, dict):
+        return None
+    queue = body.get("queue") or []
+    if not queue:
+        return None
+    shown = " | ".join(_track_line(t) for t in queue[:3])
+    extra = len(queue) - 3
+    return shown + ("  (+%d more)" % extra if extra > 0 else "")
+
+
+def _parse_iso8601(text):
+    """ISO-8601 UTC ('...Z', optional fractional secs) -> epoch seconds or None."""
+    text = (text or "").strip().replace("Z", "")
+    if "." in text:
+        text = text.split(".", 1)[0]
+    try:
+        return calendar.timegm(time.strptime(text, "%Y-%m-%dT%H:%M:%S"))
+    except ValueError:
+        return None
+
+
+def _fmt_dur_secs(secs):
+    """Seconds -> 'Xh YYm' / 'Ym'."""
+    secs = int(secs)
+    hrs, mins = secs // 3600, (secs % 3600) // 60
+    return "%dh %02dm" % (hrs, mins) if hrs else "%dm" % mins
+
+
+def session_summary(access):
+    """Approximate the current listening 'session' from recently-played.
+
+    The Web API has no session object; this walks back through the last 50
+    completed plays while the gap between consecutive plays stays under
+    SESSION_GAP, and reports the run length, span and distinct artists.
+    """
+    status, body = http_request(
+        "GET", API + "/me/player/recently-played?limit=50", token=access)
+    if status == 403:
+        return "(re-auth needed: user-read-recently-played)"
+    if status != 200 or not isinstance(body, dict):
+        return "(error: HTTP %s)" % status
+    stamps = []
+    for it in body.get("items") or []:
+        when = _parse_iso8601(it.get("played_at", ""))
+        if when is not None:
+            stamps.append((when, it.get("track") or {}))
+    if not stamps:
+        return "(no recent plays)"
+    session_gap = 30 * 60
+    run = [stamps[0]]
+    for newer, older in zip(stamps, stamps[1:]):
+        if newer[0] - older[0] > session_gap:
+            break
+        run.append(older)
+    span = stamps[0][0] - run[-1][0]
+    artists = []
+    for _, track in run:
+        for a in track.get("artists", []):
+            name = a.get("name")
+            if name and name not in artists:
+                artists.append(name)
+    capped = " (50-play cap)" if len(run) == 50 else ""
+    return "%d completed tracks over %s, %d artist%s%s" % (
+        len(run), _fmt_dur_secs(span), len(artists),
+        "" if len(artists) == 1 else "s", capped)
+
+
+def top_lines(access, time_range="short_term"):
+    """Top track + artist over a time range (user-top-read). List of str."""
+    label = {"short_term": "4 wks", "medium_term": "6 mo",
+             "long_term": "1 yr"}.get(time_range, time_range)
+    out = []
+    base = API + "/me/top/%s?time_range=%s&limit=1"
+    status, body = http_request("GET", base % ("tracks", time_range), token=access)
+    if status == 403:
+        return ["(re-auth needed: user-top-read)"]
+    if status == 200 and isinstance(body, dict) and body.get("items"):
+        out.append("top track:   %s  (%s)" % (_track_line(body["items"][0]), label))
+    status, body = http_request("GET", base % ("artists", time_range), token=access)
+    if status == 200 and isinstance(body, dict) and body.get("items"):
+        out.append("top artist:  %s  (%s)" % (body["items"][0].get("name", "?"), label))
+    return out
+
+
 def status_report(cfg, probe=False):
     """Build status lines + needs_reauth flag. No side effects (no alerts)."""
     tok = read_json(TOKEN_FILE, {})
     lines = []
     lines.append("host:        %s" % hostname())
+    up = system_uptime()
+    try:
+        up += "  (load %.2f %.2f %.2f)" % os.getloadavg()
+    except (OSError, AttributeError):
+        pass
+    lines.append("uptime:      %s" % up)
     lines.append("config dir:  %s" % CONFIG_DIR)
     lines.append("config.env:  %s" % ("present" if os.path.exists(CONFIG_ENV) else "MISSING"))
     lines.append("client id:   %s" % ("set" if cfg.get("CLIENT_ID") else "MISSING"))
@@ -680,7 +851,16 @@ def status_report(cfg, probe=False):
             lines.append("devices:     %s" % (", ".join(n for n in names if n) or "(none)"))
             target = cfg.get("DEVICE_NAME", "Web Player (Chrome)")
             lines.append("kiosk dev:   %s" % ("present" if target in names else "ABSENT"))
-            lines.append("now playing: %s" % now_playing_text(cfg))
+            lines.extend(playback_lines(cfg, access))
+            scopes = (tok.get("scope") or "").split()
+            if "user-read-recently-played" in scopes:
+                lines.append("session:     %s" % session_summary(access))
+            else:
+                lines.append("session:     (re-auth needed: user-read-recently-played)")
+            if "user-top-read" in scopes:
+                lines.extend(top_lines(access))
+            else:
+                lines.append("top stats:   (re-auth needed: user-top-read)")
         except (AuthNeeded, Transient) as exc:
             lines.append("probe:       failed (%s)" % exc)
 
@@ -736,12 +916,7 @@ def now_playing_text(cfg):
     item = body.get("item")
     if not item:
         return "(nothing playing)"
-    if item.get("type") == "episode":
-        show = (item.get("show") or {}).get("name", "Unknown show")
-        text = "%s — %s" % (show, item.get("name", "Unknown episode"))
-    else:
-        artists = ", ".join(a.get("name", "") for a in item.get("artists", []))
-        text = "%s — %s" % (artists, item.get("name", "Unknown track"))
+    text = _track_line(item)
     if not body.get("is_playing", False):
         text += "  [paused]"
     return text
@@ -997,7 +1172,7 @@ BOT_OFFSET_FILE = os.path.join(CONFIG_DIR, "bot-offset.json")
 BOT_REAUTH_TIMEOUT = 300
 
 BOT_COMMANDS = [
-    ("status", "token / device health (add 'detailed' for a live probe)"),
+    ("status", "token / device health (add 'detailed' for a live playback probe)"),
     ("nowplaying", "what is playing right now"),
     ("resume", "play the configured context if the kiosk is idle"),
     ("restart", "restart the kiosk service"),

@@ -11,7 +11,10 @@
    shared secret. The tooling only ever needs the **Client ID** (not sensitive)
    and a user refresh token.
 3. **Least privilege.** Everything runs as your normal user via
-   `systemd --user`. No root cron, no `sudo` in the hot path.
+   `systemd --user`. No root cron, no `sudo` in the hot path. The OAuth scopes
+   are limited to playback read/control plus two **read-only** stats scopes
+   (`user-read-recently-played`, `user-top-read`) used by `status --probe`; none
+   grant library, social, or account-write access.
 
 ## What's stored, and where
 

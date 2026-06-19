@@ -96,7 +96,14 @@ spotify-auto status --probe
 ```
 
 You should see your refresh token stored, the 6-month-wall date, and — if the
-kiosk is up — `kiosk dev: present`.
+kiosk is up — `kiosk dev: present`. With a current token it also reports system
+uptime plus live playback detail (progress, shuffle, volume, "up next" queue),
+an approximate listening-session summary, and your top track/artist.
+
+> The session summary and top-stats lines need the `user-read-recently-played`
+> and `user-top-read` scopes. They ship in the default `SCOPES`, but **changing
+> scopes only takes effect after a re-auth** (`spotify-auto reauth`); until then
+> those lines read `(re-auth needed: …)`.
 
 ---
 

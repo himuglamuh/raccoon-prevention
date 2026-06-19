@@ -51,7 +51,7 @@ secrets/state: ~/.config/spotify-auto/{config.env, token.json, auth-needed, ...}
 |---|---|
 | `reauth` | Interactive PKCE (re-)authorization. `--remote` authorizes from your phone via Tailscale Serve HTTPS. |
 | `token` | Print a valid access token (refresh + rotate under lock; cached until ~60 s before expiry). |
-| `status` | Token/device health; `--probe` queries Spotify live; `--alert` fires the 6-month-wall reminder. |
+| `status` | Token/device health + system uptime; `--probe` queries Spotify live (playback detail, queue, session + top-stats); `--alert` fires the 6-month-wall reminder. |
 | `now-playing` | Print `Artist — Title` (used by `now-playing`/`marq-playing`). |
 | `auto-resume` | If the kiosk is idle, start the configured context (+ repeat). Random-volume heartbeat when already playing. |
 | `watchdog` | Probe DevTools + Connect-device presence; restart the kiosk after 3 consecutive failures. |
@@ -95,7 +95,7 @@ Then message your bot:
 | Command | What it does |
 |---|---|
 | `/status` | Token / device health (general). |
-| `/status detailed` | Live probe: device list, kiosk presence, current track. |
+| `/status detailed` | Live probe: system uptime/load, device list, kiosk presence, current track with progress/shuffle/volume/context, "up next" queue, an approximate listening-session summary, and your top track/artist (last two need the `user-read-recently-played` + `user-top-read` scopes). |
 | `/nowplaying` | What's playing right now. |
 | `/resume` | Play the configured context if the kiosk is idle. |
 | `/restart` | Restart the kiosk service. |
